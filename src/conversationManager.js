@@ -1,9 +1,25 @@
 /**
  * VoxFlow — Conversation Manager
  * Multi-turn context tracking, API communication, and chat UI rendering.
+ * Displays tool-usage badges, source citations, action confirmation cards,
+ * and optional debug panel on assistant messages.
  */
 
 const MAX_HISTORY = 20;
+
+// Tool badge config
+const TOOL_BADGES = {
+  retrieval: { icon: '🔍', label: 'Retrieved', className: 'badge-retrieval' },
+  api:       { icon: '⚡', label: 'Action',    className: 'badge-api' },
+  reasoning: { icon: '🧠', label: 'Reasoning', className: 'badge-reasoning' },
+};
+
+// Query type labels
+const QUERY_TYPE_LABELS = {
+  KNOWLEDGE: { icon: '📚', label: 'Knowledge' },
+  ACTION:    { icon: '⚙️', label: 'Action' },
+  GENERAL:   { icon: '💬', label: 'General' },
+};
 
 export class ConversationManager {
   constructor({ chatContainer, onStatusChange }) {
@@ -11,6 +27,17 @@ export class ConversationManager {
     this.onStatusChange = onStatusChange;
     this.history = [];
     this.isProcessing = false;
+    this.debugMode = false;
+    this.sessionId = `session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  /** Toggle debug mode */
+  setDebugMode(enabled) {
+    this.debugMode = enabled;
+    // Toggle visibility of existing debug panels
+    document.querySelectorAll('.debug-panel').forEach(el => {
+      el.classList.toggle('hidden', !enabled);
+    });
   }
 
   /** Send user message, get assistant reply */
@@ -34,6 +61,8 @@ export class ConversationManager {
         body: JSON.stringify({
           message: userText.trim(),
           history: this.history.slice(-MAX_HISTORY),
+          sessionId: this.sessionId,
+          debug: this.debugMode,
         }),
       });
 
@@ -47,7 +76,13 @@ export class ConversationManager {
 
       // Add assistant reply
       this.history.push({ role: 'assistant', content: reply });
-      this._renderMessage('assistant', reply, data.action);
+      this._renderMessage('assistant', reply, {
+        action: data.action,
+        toolUsed: data.toolUsed,
+        queryType: data.queryType,
+        sources: data.sources,
+        debug: data.debug,
+      });
 
       this.isProcessing = false;
       this.onStatusChange?.('ready', 'Ready');
@@ -71,11 +106,16 @@ export class ConversationManager {
   }
 
   /** Render a chat bubble */
-  _renderMessage(role, text, action) {
+  _renderMessage(role, text, meta = {}) {
     const msgEl = document.createElement('div');
     msgEl.className = `message ${role}-message`;
 
     if (role === 'assistant') {
+      const badgeHtml = this._renderToolBadge(meta.toolUsed, meta.queryType);
+      const sourcesHtml = this._renderSources(meta.sources);
+      const actionHtml = meta.action ? this._renderActionCard(meta.action) : '';
+      const debugHtml = this._renderDebugPanel(meta.debug);
+
       msgEl.innerHTML = `
         <div class="message-avatar">
           <svg viewBox="0 0 32 32" fill="none">
@@ -90,10 +130,18 @@ export class ConversationManager {
           </svg>
         </div>
         <div class="message-content">
+          ${badgeHtml}
           <p>${this._escapeHtml(text)}</p>
-          ${action ? this._renderAction(action) : ''}
+          ${actionHtml}
+          ${sourcesHtml}
+          ${debugHtml}
         </div>
       `;
+
+      // Bind action button handlers after inserting into DOM
+      if (meta.action) {
+        setTimeout(() => this._bindActionButtons(msgEl, meta.action), 0);
+      }
     } else {
       msgEl.innerHTML = `
         <div class="message-content">
@@ -106,12 +154,226 @@ export class ConversationManager {
     this._scrollToBottom();
   }
 
-  /** Render action confirmation card */
-  _renderAction(action) {
+  /** Render tool-used badge with query type */
+  _renderToolBadge(toolUsed, queryType) {
+    let html = '';
+
+    if (queryType && QUERY_TYPE_LABELS[queryType]) {
+      const qt = QUERY_TYPE_LABELS[queryType];
+      html += `<span class="query-type-badge">${qt.icon} ${qt.label}</span>`;
+    }
+
+    if (toolUsed && TOOL_BADGES[toolUsed]) {
+      const badge = TOOL_BADGES[toolUsed];
+      html += `<span class="tool-badge ${badge.className}">${badge.icon} ${badge.label}</span>`;
+    }
+
+    return html ? `<div class="badge-row">${html}</div>` : '';
+  }
+
+  /** Render source citations */
+  _renderSources(sources) {
+    if (!sources || sources.length === 0) return '';
+    const items = sources
+      .map(s => `<span class="source-tag">${this._escapeHtml(s)}</span>`)
+      .join('');
+    return `<div class="sources-row">Sources: ${items}</div>`;
+  }
+
+  /** Render action confirmation card with Confirm/Cancel buttons */
+  _renderActionCard(action) {
+    const statusIcon = action.status === 'confirmed' ? '✅'
+      : action.status === 'cancelled' ? '❌'
+      : action.status === 'awaiting_confirmation' ? '⏳'
+      : '⚡';
+
+    const detailsHtml = action.details
+      ? this._renderActionDetails(action.details)
+      : '';
+
     return `
-      <div class="action-card">
-        <div class="action-card-title">⚡ ${this._escapeHtml(action.type || 'Action')}</div>
+      <div class="action-card" data-action-id="${action.id}">
+        <div class="action-card-header">
+          <div class="action-card-title">${action.icon || statusIcon} ${this._escapeHtml(action.type || 'Action')}</div>
+          <div class="action-card-status-badge status-${action.status}">${statusIcon} ${this._formatStatus(action.status)}</div>
+        </div>
         <div class="action-card-body">${this._escapeHtml(action.description || '')}</div>
+        ${detailsHtml}
+        <div class="action-btns" data-action-id="${action.id}">
+          <button class="action-btn confirm" data-action="confirm" data-action-id="${action.id}">✓ Confirm</button>
+          <button class="action-btn cancel" data-action="cancel" data-action-id="${action.id}">✕ Cancel</button>
+        </div>
+      </div>
+    `;
+  }
+
+  /** Render extracted action details */
+  _renderActionDetails(details) {
+    const entries = Object.entries(details)
+      .filter(([k, v]) => k !== 'raw' && v)
+      .map(([k, v]) => `<span class="detail-item"><strong>${k}:</strong> ${this._escapeHtml(v)}</span>`)
+      .join('');
+
+    return entries ? `<div class="action-details">${entries}</div>` : '';
+  }
+
+  /** Format action status for display */
+  _formatStatus(status) {
+    const labels = {
+      awaiting_confirmation: 'Awaiting Confirmation',
+      confirmed: 'Confirmed',
+      cancelled: 'Cancelled',
+      pending: 'Pending',
+    };
+    return labels[status] || status;
+  }
+
+  /** Bind confirm/cancel button handlers */
+  _bindActionButtons(msgEl, action) {
+    const confirmBtn = msgEl.querySelector(`.action-btn.confirm[data-action-id="${action.id}"]`);
+    const cancelBtn = msgEl.querySelector(`.action-btn.cancel[data-action-id="${action.id}"]`);
+
+    if (confirmBtn) {
+      confirmBtn.addEventListener('click', () => this._handleActionConfirm(action.id, msgEl));
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', () => this._handleActionCancel(action.id, msgEl));
+    }
+  }
+
+  /** Handle action confirmation */
+  async _handleActionConfirm(actionId, msgEl) {
+    const card = msgEl.querySelector(`.action-card[data-action-id="${actionId}"]`);
+    const btns = card?.querySelector('.action-btns');
+    if (btns) btns.innerHTML = '<span class="action-loading">Processing...</span>';
+
+    try {
+      const resp = await fetch('/api/action/confirm', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actionId, sessionId: this.sessionId }),
+      });
+
+      const data = await resp.json();
+
+      if (resp.ok) {
+        // Update the card UI
+        this._updateActionCard(card, 'confirmed', data.result?.message || 'Action completed!');
+      } else {
+        this._updateActionCard(card, 'error', data.error || 'Failed to confirm.');
+      }
+    } catch (err) {
+      console.error('[VoxFlow] Action confirm error:', err);
+      this._updateActionCard(card, 'error', 'Network error. Please try again.');
+    }
+  }
+
+  /** Handle action cancellation */
+  async _handleActionCancel(actionId, msgEl) {
+    const card = msgEl.querySelector(`.action-card[data-action-id="${actionId}"]`);
+    const btns = card?.querySelector('.action-btns');
+    if (btns) btns.innerHTML = '<span class="action-loading">Cancelling...</span>';
+
+    try {
+      const resp = await fetch('/api/action/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ actionId, sessionId: this.sessionId }),
+      });
+
+      if (resp.ok) {
+        this._updateActionCard(card, 'cancelled', 'Action was cancelled.');
+      } else {
+        const data = await resp.json();
+        this._updateActionCard(card, 'error', data.error || 'Failed to cancel.');
+      }
+    } catch (err) {
+      console.error('[VoxFlow] Action cancel error:', err);
+      this._updateActionCard(card, 'error', 'Network error. Please try again.');
+    }
+  }
+
+  /** Update action card after confirm/cancel */
+  _updateActionCard(card, status, resultMessage) {
+    if (!card) return;
+
+    const statusBadge = card.querySelector('.action-card-status-badge');
+    const btnsArea = card.querySelector('.action-btns');
+
+    if (status === 'confirmed') {
+      card.classList.add('confirmed');
+      if (statusBadge) {
+        statusBadge.textContent = '✅ Confirmed';
+        statusBadge.className = 'action-card-status-badge status-confirmed';
+      }
+      if (btnsArea) {
+        btnsArea.innerHTML = `<div class="action-result success">✅ ${this._escapeHtml(resultMessage)}</div>`;
+      }
+    } else if (status === 'cancelled') {
+      card.classList.add('cancelled');
+      if (statusBadge) {
+        statusBadge.textContent = '❌ Cancelled';
+        statusBadge.className = 'action-card-status-badge status-cancelled';
+      }
+      if (btnsArea) {
+        btnsArea.innerHTML = `<div class="action-result cancelled">❌ ${this._escapeHtml(resultMessage)}</div>`;
+      }
+    } else {
+      if (btnsArea) {
+        btnsArea.innerHTML = `<div class="action-result error">⚠️ ${this._escapeHtml(resultMessage)}</div>`;
+      }
+    }
+  }
+
+  /** Render debug panel (hidden by default, toggled via header switch) */
+  _renderDebugPanel(debug) {
+    if (!debug) return '';
+
+    const hiddenClass = this.debugMode ? '' : 'hidden';
+
+    return `
+      <div class="debug-panel ${hiddenClass}">
+        <div class="debug-title">🔍 Pipeline Trace</div>
+        <div class="debug-grid">
+          <div class="debug-item">
+            <span class="debug-label">Query Type</span>
+            <span class="debug-value">${debug.queryType || '—'}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Intent</span>
+            <span class="debug-value">${debug.intent || '—'}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Tool</span>
+            <span class="debug-value">${debug.toolUsed || '—'}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Latency</span>
+            <span class="debug-value">${debug.latencyMs || 0}ms</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Sources</span>
+            <span class="debug-value">${debug.sourcesCount || 0}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Follow-up</span>
+            <span class="debug-value">${debug.isFollowUp ? 'Yes' : 'No'}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Turn</span>
+            <span class="debug-value">#${debug.turnCount || 0}</span>
+          </div>
+          <div class="debug-item">
+            <span class="debug-label">Action</span>
+            <span class="debug-value">${debug.actionTaken || '—'}</span>
+          </div>
+        </div>
+        ${debug.contextUsed && debug.contextUsed !== '(none)'
+          ? `<div class="debug-context">
+               <span class="debug-label">Context</span>
+               <div class="debug-context-text">${this._escapeHtml(debug.contextUsed)}</div>
+             </div>`
+          : ''}
       </div>
     `;
   }

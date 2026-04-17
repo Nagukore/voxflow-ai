@@ -4,18 +4,25 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"node server/index.js\"",
+    "dev": "npm run dev:clean && concurrently \"npm:dev:frontend\" \"npm:dev:backend\"",
+    "dev:clean": "kill-port 3001 5173 5174",
     "dev:frontend": "vite",
-    "dev:backend": "node server/index.js",
+    "dev:backend": "nodemon --watch server --ext js --exec \"node server/index.js\"",
     "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "cors": "^2.8.5"
+    "@google/generative-ai": "^0.24.1",
+    "@qdrant/js-client-rest": "^1.17.0",
+    "@vapi-ai/web": "^2.5.2",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2"
   },
   "devDependencies": {
-    "vite": "^5.4.0",
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "kill-port": "^2.0.1",
+    "nodemon": "^3.1.14",
+    "vite": "^5.4.0"
   }
 }

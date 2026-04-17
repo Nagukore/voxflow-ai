@@ -5,7 +5,7 @@ import requests
 app = FastAPI()
 
 
-# 🔹 LLM CALL (FIXED + STABLE)
+# LLM CALL (FIXED + STABLE)
 def call_ollama(prompt):
     try:
         response = requests.post(
@@ -15,7 +15,7 @@ def call_ollama(prompt):
                 "messages": [
                     {"role": "user", "content": prompt}
                 ],
-                "stream": False   # 🔥 IMPORTANT FIX
+                "stream": False   # IMPORTANT FIX
             }
         )
 
@@ -24,11 +24,11 @@ def call_ollama(prompt):
         return data.get("message", {}).get("content", None)
 
     except Exception as e:
-        print("❌ Ollama HTTP failed:", e)
+        print("Ollama HTTP failed:", e)
         return None
 
 
-# 🔹 Categorize results
+# Categorize results
 def categorize(results):
     blockers, decisions, deadlines = [], [], []
 
@@ -43,15 +43,15 @@ def categorize(results):
     return blockers, decisions, deadlines
 
 
-# 🔥 MAIN ENDPOINT
+# MAIN ENDPOINT
 @app.get("/ask")
 def ask_system(q: str):
 
-    print("\n🔥 NEW REQUEST:", q)
+    print("\nNEW REQUEST:", q)
 
-    # 🔹 STEP 1: Intent understanding (optional but powerful)
+    # STEP 1: Intent understanding (optional but powerful)
     try:
-        print("👉 Running intent model...")
+        print("Running intent model...")
 
         intent_prompt = f"""
         Convert the user query into a clean search query.
@@ -68,20 +68,20 @@ def ask_system(q: str):
         else:
             refined_query = q
 
-        print("✅ Refined Query:", refined_query)
+        print("Refined Query:", refined_query)
 
     except Exception as e:
-        print("❌ Intent failed:", e)
+        print("Intent failed:", e)
         refined_query = q
 
 
-    # 🔹 STEP 2: Retrieve from Qdrant
+    # STEP 2: Retrieve from Qdrant
     try:
-        print("👉 Querying Qdrant...")
+        print("Querying Qdrant...")
 
         results = retrieve_context(refined_query)
 
-        print("✅ Retrieved:", results)
+        print("Retrieved:", results)
 
         if not results:
             return {
@@ -90,17 +90,17 @@ def ask_system(q: str):
             }
 
     except Exception as e:
-        print("❌ Qdrant failed:", e)
+        print("Qdrant failed:", e)
         return {"error": f"Qdrant error: {str(e)}"}
 
 
-    # 🔹 STEP 3: Build context
+    # STEP 3: Build context
     context = "\n".join([r.get("text", "") for r in results])
 
 
-    # 🔹 STEP 4: Final LLM reasoning
+    # STEP 4: Final LLM reasoning
     try:
-        print("👉 Running final LLM...")
+        print("Running final LLM...")
 
         final_prompt = f"""
         Context:
@@ -115,16 +115,40 @@ def ask_system(q: str):
         answer = call_ollama(final_prompt)
 
         if not answer:
-            answer = "Retrieved relevant information, but LLM response failed."
+            q_lower = q.lower()
+            blockers, decisions, deadlines = categorize(results)
+            if "blocker" in q_lower or "blocking" in q_lower or "blocked" in q_lower:
+                if blockers:
+                    answer = "Top blockers: " + "; ".join(blockers[:3])
+                else:
+                    answer = "I did not find explicit blocker entries, but related items are: " + "; ".join(
+                        [r.get("text", "") for r in results[:3]]
+                    )
+            elif "decision" in q_lower or "decide" in q_lower:
+                if decisions:
+                    answer = "Key decisions: " + "; ".join(decisions[:3])
+                else:
+                    answer = "I did not find explicit decision entries. Closest matches are: " + "; ".join(
+                        [r.get("text", "") for r in results[:3]]
+                    )
+            elif "deadline" in q_lower or "due" in q_lower:
+                if deadlines:
+                    answer = "Upcoming deadlines: " + "; ".join(deadlines[:3])
+                else:
+                    answer = "I did not find explicit deadline entries. Closest matches are: " + "; ".join(
+                        [r.get("text", "") for r in results[:3]]
+                    )
+            else:
+                answer = "Here are the top relevant updates: " + "; ".join([r.get("text", "") for r in results[:3]])
 
-        print("✅ Answer generated")
+        print("Answer generated")
 
     except Exception as e:
-        print("❌ Final LLM failed:", e)
+        print("Final LLM failed:", e)
         answer = "LLM failed, but data retrieved."
 
 
-    # 🔹 STEP 5: Categorize insights
+    # STEP 5: Categorize insights
     blockers, decisions, deadlines = categorize(results)
 
 

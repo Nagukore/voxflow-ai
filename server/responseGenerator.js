@@ -1,0 +1,239 @@
+/**
+ * VoxFlow — Response Generator
+ * Generates voice-friendly responses using LLM API (Gemini/OpenAI)
+ * with a smart template fallback when no API key is configured.
+ *
+ * Design:
+ *  - Context available → ground response in retrieved context
+ *  - No context → reason with uncertainty disclosure
+ *  - Action prepared → confirm clearly with details
+ *  - Always voice-first: 1–3 sentences, natural spoken language
+ */
+
+// ══════════════════════════════════════════════════════════════
+// ── LLM Integration ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+let geminiModel = null;
+
+/**
+ * Initialize the LLM provider if an API key is available.
+ * Called once at server startup.
+ */
+export async function initLLM() {
+  const provider = process.env.LLM_PROVIDER || 'gemini';
+  const geminiKey = process.env.GEMINI_API_KEY;
+
+  if (provider === 'gemini' && geminiKey) {
+    try {
+      const { GoogleGenerativeAI } = await import('@google/generative-ai');
+      const genAI = new GoogleGenerativeAI(geminiKey);
+      geminiModel = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+      console.log('[VoxFlow] ✅ Gemini LLM initialized');
+      return true;
+    } catch (err) {
+      console.warn('[VoxFlow] ⚠️ Gemini initialization failed:', err.message);
+      return false;
+    }
+  }
+
+  console.log('[VoxFlow] ℹ️ No LLM API key configured — using template fallback');
+  return false;
+}
+
+/**
+ * Check if LLM is available.
+ */
+export function isLLMAvailable() {
+  return geminiModel !== null;
+}
+
+// ══════════════════════════════════════════════════════════════
+// ── LLM Response Generation ─────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+const SYSTEM_PROMPT = `You are VoxFlow, a voice-first AI assistant. Follow these rules STRICTLY:
+
+1. Keep responses SHORT — 1 to 3 sentences max.
+2. Use natural spoken language — as if you're talking to a friend.
+3. Never expose technical details (embeddings, APIs, tools, models).
+4. If context is provided, base your answer ONLY on that context.
+5. If no context is available, say "I couldn't find specific information on that, but here's what I know" and give a brief general answer.
+6. Never fabricate facts or make up data.
+7. End with a natural follow-up suggestion when appropriate.
+8. Don't start with "Based on..." or "According to..." — just answer naturally.`;
+
+/**
+ * Generate a response using the LLM.
+ * @param {object} params
+ * @returns {Promise<string>}
+ */
+async function llmGenerate({ queryType, intent, message, contextText, history }) {
+  if (!geminiModel) return null;
+
+  let prompt = '';
+
+  if (queryType === 'KNOWLEDGE' && contextText) {
+    prompt = `Context:\n${contextText}\n\nUser question: "${message}"\n\nAnswer the user's question based ONLY on the context above. Be concise and voice-friendly.`;
+  } else if (queryType === 'ACTION') {
+    prompt = `The user wants to perform an action (${intent}). Their message: "${message}"\n\nAcknowledge the request naturally, and ask for any missing details needed to complete the action. Be concise.`;
+  } else {
+    prompt = `User message: "${message}"\n\nRespond naturally and concisely as a friendly voice assistant.`;
+  }
+
+  try {
+    const chat = geminiModel.startChat({
+      history: [],
+      systemInstruction: SYSTEM_PROMPT,
+    });
+
+    const result = await chat.sendMessage(prompt);
+    const text = result.response.text();
+
+    // Ensure response isn't too long for voice
+    return truncateForVoice(text);
+  } catch (err) {
+    console.error('[VoxFlow] LLM generation error:', err.message);
+    return null; // Fall through to template
+  }
+}
+
+/**
+ * Truncate a response to be voice-friendly (max ~3 sentences).
+ */
+function truncateForVoice(text, maxSentences = 3) {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  if (sentences.length <= maxSentences) return text.trim();
+  return sentences.slice(0, maxSentences).join(' ').trim();
+}
+
+// ══════════════════════════════════════════════════════════════
+// ── Template Fallback Engine ─────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+const STATIC_RESPONSES = {
+  greeting: [
+    "Hey! How can I help you today?",
+    "Hello there! What can I do for you?",
+    "Hi! I'm ready to help. What do you need?",
+    "Hey! Good to hear from you. What's on your mind?",
+  ],
+  farewell: [
+    "Take care! Let me know if you need anything else.",
+    "Goodbye! Have a great day.",
+    "See you later! I'll be here whenever you need me.",
+  ],
+  thanks: [
+    "You're welcome! Anything else I can help with?",
+    "Happy to help! Let me know if there's more.",
+    "No problem at all! What else do you need?",
+  ],
+  time: () => {
+    const now = new Date();
+    return `It's currently ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}. Anything else?`;
+  },
+  date: () => {
+    const now = new Date();
+    return `Today is ${now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}. What else can I help with?`;
+  },
+  joke: [
+    "Why don't scientists trust atoms? Because they make up everything!",
+    "I told my computer I needed a break. Now it won't stop sending me vacation ads.",
+    "Why did the developer go broke? Because he used up all his cache!",
+    "What do you call a fake noodle? An impasta!",
+    "Why do programmers prefer dark mode? Because the light attracts bugs!",
+  ],
+  name: [
+    "I'm VoxFlow — your voice-first AI assistant. I'm here to help you get things done through conversation. What do you need?",
+  ],
+  status: [
+    "I'm doing great, thanks for asking! Ready to help you with whatever you need.",
+    "All systems go! What can I help you with?",
+  ],
+};
+
+const GENERAL_FALLBACK = [
+  "Interesting! Could you give me a bit more detail so I can help you better?",
+  "That's a great question. Could you rephrase or add more context so I can give you a solid answer?",
+  "Got it. I want to make sure I get this right — can you tell me a bit more?",
+  "I'd love to help with that! Could you elaborate a little?",
+];
+
+const NO_CONTEXT_RESPONSES = [
+  "I couldn't find specific information on that, but I'm happy to help if you can give me more details.",
+  "I don't have specific knowledge about that topic, but feel free to ask something else or give me more context.",
+  "I wasn't able to find relevant information for that. Want me to try a different angle?",
+];
+
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+/**
+ * Generate a response using templates (fallback when no LLM).
+ */
+function templateGenerate({ queryType, intent, message, contextText, action, conversationContext }) {
+  // ── Static responses (greeting, farewell, etc.) ──
+  const staticSet = STATIC_RESPONSES[intent];
+  if (staticSet) {
+    if (typeof staticSet === 'function') return staticSet();
+    return pickRandom(staticSet);
+  }
+
+  // ── Knowledge query with context ──
+  if (queryType === 'KNOWLEDGE' && contextText) {
+    const followUp = conversationContext?.isFollowUp
+      ? " Is there anything specific you'd like me to elaborate on?"
+      : " What would you like to do next?";
+    return contextText.split('\n\n')[0] + followUp;
+  }
+
+  // ── Knowledge query without context ──
+  if (queryType === 'KNOWLEDGE' && !contextText) {
+    return pickRandom(NO_CONTEXT_RESPONSES);
+  }
+
+  // ── Action query ──
+  if (queryType === 'ACTION' && action) {
+    return action.followUp;
+  }
+
+  // ── Context-aware follow-up ──
+  if (conversationContext?.isFollowUp && conversationContext.lastTopic) {
+    return `Building on what we were discussing — ${pickRandom(GENERAL_FALLBACK)}`;
+  }
+
+  // ── General fallback ──
+  return pickRandom(GENERAL_FALLBACK);
+}
+
+// ══════════════════════════════════════════════════════════════
+// ── Public API ───────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * Generate the final response.
+ * Uses LLM if available, falls back to templates.
+ *
+ * @param {object} params
+ * @param {'KNOWLEDGE'|'ACTION'|'GENERAL'} params.queryType
+ * @param {string} params.intent
+ * @param {string} params.message
+ * @param {string} [params.contextText] - Retrieved context for grounding
+ * @param {object} [params.action] - Prepared action descriptor
+ * @param {Array}  [params.history] - Conversation history
+ * @param {object} [params.conversationContext] - Analyzed context
+ * @returns {Promise<string>}
+ */
+export async function generateResponse(params) {
+  const { queryType, intent, message, contextText, action, history, conversationContext } = params;
+
+  // Try LLM first
+  if (isLLMAvailable() && !STATIC_RESPONSES[intent]) {
+    const llmReply = await llmGenerate({ queryType, intent, message, contextText, history });
+    if (llmReply) return llmReply;
+  }
+
+  // Fallback to templates
+  return templateGenerate({ queryType, intent, message, contextText, action, conversationContext });
+}

@@ -1,12 +1,14 @@
 /**
  * VoxFlow — Main Application Bootstrap
- * Wires up UI elements, initializes speech engines, and handles the conversation flow.
+ * Wires up UI elements, initializes voice engines (Vapi or browser fallback),
+ * and handles the conversation flow.
  */
 
 import './style.css';
 import { SpeechRecognizer } from './speechRecognition.js';
 import { SpeechSynth } from './speechSynthesis.js';
 import { ConversationManager } from './conversationManager.js';
+import { VapiVoice } from './vapiVoice.js';
 
 // ── DOM References ──
 const micBtn = document.getElementById('micBtn');
@@ -19,6 +21,7 @@ const statusText = document.getElementById('statusText');
 const liveTranscript = document.getElementById('liveTranscript');
 const transcriptText = document.getElementById('transcriptText');
 const chatMessages = document.getElementById('chatMessages');
+const debugToggle = document.getElementById('debugToggle');
 
 // ── Status Helper ──
 function setStatus(state, text) {
@@ -33,54 +36,131 @@ const conversation = new ConversationManager({
   onStatusChange: setStatus,
 });
 
-// ── Speech Synthesis ──
-const tts = new SpeechSynth({
-  rate: 1.05,
-  onStart: () => setStatus('processing', 'Speaking'),
-  onEnd: () => setStatus('ready', 'Ready'),
-});
-
-// ── Speech Recognition ──
+// ── Voice Engine ──
+// We initialize asynchronously — fetch config from server to decide Vapi vs browser
+let voiceEngine = null; // 'vapi' | 'browser' | null
+let vapiVoice = null;
 let recognizer = null;
+let tts = null;
 
-if (SpeechRecognizer.isSupported()) {
-  recognizer = new SpeechRecognizer({
-    onStart: () => {
-      micBtn.classList.add('listening');
-      micIcon.classList.add('hidden');
-      micStopIcon.classList.remove('hidden');
-      liveTranscript.classList.remove('hidden');
-      transcriptText.textContent = 'Listening...';
-      setStatus('listening', 'Listening');
-      tts.cancel(); // Stop TTS when user starts speaking
-    },
-    onInterim: (text) => {
-      transcriptText.textContent = text;
-    },
-    onResult: async (text) => {
-      transcriptText.textContent = text;
-      // Small delay so user can see the final transcript
-      setTimeout(async () => {
-        stopListeningUI();
-        const reply = await conversation.send(text);
-        if (reply) tts.speak(reply);
-      }, 300);
-    },
-    onEnd: () => {
-      stopListeningUI();
-    },
-    onError: (err) => {
-      stopListeningUI();
-      if (err === 'not-allowed') {
-        setStatus('error', 'Mic denied');
+async function initVoice() {
+  try {
+    // Fetch Vapi config from server
+    const resp = await fetch('/api/config');
+    const config = await resp.json();
+
+    if (config.vapi?.enabled) {
+      // ── Use Vapi for voice ──
+      console.log('[VoxFlow] 🎙️ Initializing Vapi voice...');
+
+      vapiVoice = new VapiVoice({
+        publicKey: config.vapi.publicKey,
+        assistantId: config.vapi.assistantId,
+
+        onCallStart: () => {
+          micBtn.classList.add('listening');
+          micIcon.classList.add('hidden');
+          micStopIcon.classList.remove('hidden');
+          liveTranscript.classList.remove('hidden');
+          transcriptText.textContent = 'Connected — speak now...';
+          setStatus('listening', 'Vapi Connected');
+        },
+
+        onCallEnd: () => {
+          stopListeningUI();
+          setStatus('ready', 'Ready');
+        },
+
+        onTranscript: (data) => {
+          if (data.role === 'user') {
+            transcriptText.textContent = data.text;
+          }
+        },
+
+        onSpeechStart: () => {
+          setStatus('processing', 'Speaking');
+        },
+
+        onSpeechEnd: () => {
+          if (vapiVoice?.isInCall) {
+            setStatus('listening', 'Listening');
+          }
+        },
+
+        onError: (err) => {
+          console.error('[VoxFlow] Vapi error:', err);
+          stopListeningUI();
+          setStatus('error', 'Voice Error');
+          setTimeout(() => setStatus('ready', 'Ready'), 3000);
+        },
+      });
+
+      if (vapiVoice.isReady()) {
+        voiceEngine = 'vapi';
+        console.log('[VoxFlow] ✅ Vapi voice ready');
+      } else {
+        console.warn('[VoxFlow] Vapi init failed, falling back to browser');
+        initBrowserVoice();
       }
-    },
+    } else {
+      // ── Use browser Web Speech API ──
+      initBrowserVoice();
+    }
+  } catch (err) {
+    console.warn('[VoxFlow] Config fetch failed, using browser voice:', err);
+    initBrowserVoice();
+  }
+}
+
+function initBrowserVoice() {
+  voiceEngine = 'browser';
+  console.log('[VoxFlow] 🔊 Using browser Web Speech API');
+
+  // Speech Synthesis
+  tts = new SpeechSynth({
+    rate: 1.05,
+    onStart: () => setStatus('processing', 'Speaking'),
+    onEnd: () => setStatus('ready', 'Ready'),
   });
-} else {
-  // Disable mic button if not supported
-  micBtn.style.opacity = '0.4';
-  micBtn.style.cursor = 'not-allowed';
-  micBtn.title = 'Speech recognition not supported in this browser';
+
+  // Speech Recognition
+  if (SpeechRecognizer.isSupported()) {
+    recognizer = new SpeechRecognizer({
+      onStart: () => {
+        micBtn.classList.add('listening');
+        micIcon.classList.add('hidden');
+        micStopIcon.classList.remove('hidden');
+        liveTranscript.classList.remove('hidden');
+        transcriptText.textContent = 'Listening...';
+        setStatus('listening', 'Listening');
+        tts.cancel();
+      },
+      onInterim: (text) => {
+        transcriptText.textContent = text;
+      },
+      onResult: async (text) => {
+        transcriptText.textContent = text;
+        setTimeout(async () => {
+          stopListeningUI();
+          const reply = await conversation.send(text);
+          if (reply) tts.speak(reply);
+        }, 300);
+      },
+      onEnd: () => {
+        stopListeningUI();
+      },
+      onError: (err) => {
+        stopListeningUI();
+        if (err === 'not-allowed') {
+          setStatus('error', 'Mic denied');
+        }
+      },
+    });
+  } else {
+    micBtn.style.opacity = '0.4';
+    micBtn.style.cursor = 'not-allowed';
+    micBtn.title = 'Speech recognition not supported in this browser';
+  }
 }
 
 function stopListeningUI() {
@@ -92,10 +172,13 @@ function stopListeningUI() {
 
 // ── Event Listeners ──
 
-// Mic button
-micBtn.addEventListener('click', () => {
-  if (!recognizer) return;
-  recognizer.toggle();
+// Mic button — toggles Vapi call or browser recognition
+micBtn.addEventListener('click', async () => {
+  if (voiceEngine === 'vapi' && vapiVoice) {
+    await vapiVoice.toggle();
+  } else if (voiceEngine === 'browser' && recognizer) {
+    recognizer.toggle();
+  }
 });
 
 // Text input — send on Enter
@@ -125,7 +208,9 @@ document.addEventListener('click', async (e) => {
     if (query) {
       textInput.value = '';
       const reply = await conversation.send(query);
-      if (reply) tts.speak(reply);
+      if (reply && voiceEngine === 'browser' && tts) {
+        tts.speak(reply);
+      }
     }
   }
 });
@@ -135,9 +220,20 @@ async function sendTextMessage() {
   textInput.value = '';
   sendBtn.classList.remove('active');
   const reply = await conversation.send(text);
-  if (reply) tts.speak(reply);
+  // Only use browser TTS for typed messages if on browser voice engine
+  if (reply && voiceEngine === 'browser' && tts) {
+    tts.speak(reply);
+  }
 }
+
+// Debug toggle
+debugToggle.addEventListener('click', () => {
+  debugToggle.classList.toggle('active');
+  const isActive = debugToggle.classList.contains('active');
+  conversation.setDebugMode(isActive);
+});
 
 // ── Initialization ──
 setStatus('ready', 'Ready');
+initVoice();
 console.log('[VoxFlow] Application initialized.');
