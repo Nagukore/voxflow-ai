@@ -41,7 +41,19 @@ const conversation = new ConversationManager({
 let voiceEngine = null; // 'vapi' | 'browser' | null
 let vapiVoice = null;
 let recognizer = null;
-let tts = null;
+let lastVapiFinalTranscript = '';
+let lastVapiFinalAt = 0;
+
+// Universally initialize TTS so written queries always get vocal feedback
+let tts = new SpeechSynth({
+  rate: 1.05,
+  onStart: () => {
+    if (!vapiVoice?.isInCall) setStatus('processing', 'Speaking');
+  },
+  onEnd: () => {
+    if (!vapiVoice?.isInCall) setStatus('ready', 'Ready');
+  },
+});
 
 async function initVoice() {
   try {
@@ -74,6 +86,9 @@ async function initVoice() {
         onTranscript: (data) => {
           if (data.role === 'user') {
             transcriptText.textContent = data.text;
+            if (data.isFinal) {
+              void handleVapiFinalTranscript(data.text);
+            }
           }
         },
 
@@ -112,16 +127,36 @@ async function initVoice() {
   }
 }
 
+async function handleVapiFinalTranscript(text) {
+  const cleaned = (text || '').trim();
+  if (!cleaned) return;
+
+  // Avoid duplicate sends from repeated final transcript events.
+  const now = Date.now();
+  if (cleaned === lastVapiFinalTranscript && now - lastVapiFinalAt < 1500) {
+    return;
+  }
+  lastVapiFinalTranscript = cleaned;
+  lastVapiFinalAt = now;
+
+  const reply = await conversation.send(cleaned);
+  if (!reply) return;
+
+  // Keep voice-first behavior for Vapi calls while also rendering text in chat.
+  if (vapiVoice?.isInCall) {
+    vapiVoice.say(reply);
+    return;
+  }
+
+  // Fallback speaking path if call ended before response arrives.
+  if (tts) {
+    tts.speak(reply);
+  }
+}
+
 function initBrowserVoice() {
   voiceEngine = 'browser';
   console.log('[VoxFlow] 🔊 Using browser Web Speech API');
-
-  // Speech Synthesis
-  tts = new SpeechSynth({
-    rate: 1.05,
-    onStart: () => setStatus('processing', 'Speaking'),
-    onEnd: () => setStatus('ready', 'Ready'),
-  });
 
   // Speech Recognition
   if (SpeechRecognizer.isSupported()) {
@@ -208,7 +243,7 @@ document.addEventListener('click', async (e) => {
     if (query) {
       textInput.value = '';
       const reply = await conversation.send(query);
-      if (reply && voiceEngine === 'browser' && tts) {
+      if (reply && tts && (!vapiVoice || !vapiVoice.isInCall)) {
         tts.speak(reply);
       }
     }
@@ -220,8 +255,8 @@ async function sendTextMessage() {
   textInput.value = '';
   sendBtn.classList.remove('active');
   const reply = await conversation.send(text);
-  // Only use browser TTS for typed messages if on browser voice engine
-  if (reply && voiceEngine === 'browser' && tts) {
+  // Use browser TTS for typed messages (if not actively in a Vapi call)
+  if (reply && tts && (!vapiVoice || !vapiVoice.isInCall)) {
     tts.speak(reply);
   }
 }

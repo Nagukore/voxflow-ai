@@ -6,7 +6,15 @@
 
 // ── Intent Patterns ──────────────────────────────────────────
 const INTENTS = [
-  { name: 'greeting',     patterns: [/^(hi|hello|hey|howdy|good morning|good evening|good afternoon|sup|yo)\b/i] },
+  {
+    name: 'greeting',
+    patterns: [
+      /^(hi+|hello+|hey+|heya|howdy|sup|yo)\b/i,
+      /\b(good morning|good afternoon|good evening)\b/i,
+      /^(hello|hi|hey)[\s,!.]*(there|team|voxflow|assistant)?\b/i,
+      /^(how are you|how are u|how's it going|how is it going)\b/i,
+    ],
+  },
   { name: 'farewell',     patterns: [/^(bye|goodbye|see you|later|take care|good night)\b/i] },
   { name: 'thanks',       patterns: [/\b(thanks|thank you|appreciate|cheers)\b/i] },
   { name: 'capabilities', patterns: [/\b(what can you do|help me|capabilities|features|how do you work|what do you do)\b/i] },
@@ -46,13 +54,24 @@ const GENERAL_INTENTS = new Set([
  * @returns {string} intent name (e.g. 'greeting', 'weather', 'general')
  */
 export function detectIntent(message) {
+  const normalizedMessage = message
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+
   for (const intent of INTENTS) {
     for (const pattern of intent.patterns) {
-      if (pattern.test(message)) {
+      if (pattern.test(normalizedMessage)) {
         return intent.name;
       }
     }
   }
+
+  // Catch short conversational niceties that often miss strict patterns.
+  if (/^(gm|gn|good day|hiya|hii+|helloo+)\b/.test(normalizedMessage)) {
+    return 'greeting';
+  }
+
   return 'general';
 }
 

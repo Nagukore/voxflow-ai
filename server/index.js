@@ -13,7 +13,7 @@ import express from 'express';
 import cors from 'cors';
 import { orchestrate } from './orchestrator.js';
 import { initLLM, isLLMAvailable } from './responseGenerator.js';
-import { initQdrant, isQdrantReady } from './retriever.js';
+import { initQdrant, isQdrantReady, getRetrievalHealth } from './retriever.js';
 import {
   getSession,
   confirmPendingAction,
@@ -166,7 +166,9 @@ app.get('/api/config', (req, res) => {
 // ── GET /api/health — Health Check ──────────────────────────
 // ══════════════════════════════════════════════════════════════
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  const retrieval = await getRetrievalHealth();
+
   res.json({
     status: 'ok',
     service: 'VoxFlow Orchestrator API',
@@ -175,9 +177,25 @@ app.get('/api/health', (req, res) => {
     tools: ['retrieval', 'api', 'reasoning'],
     llmAvailable: isLLMAvailable(),
     qdrantReady: isQdrantReady(),
+    retrieval,
     vapiEnabled: !!(process.env.VAPI_PUBLIC_KEY && process.env.VAPI_ASSISTANT_ID),
     timestamp: new Date().toISOString(),
   });
+});
+
+app.get('/api/health/retrieval', async (req, res) => {
+  try {
+    const retrieval = await getRetrievalHealth();
+    res.json({
+      status: 'ok',
+      retrieval,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'error',
+      error: err?.message || 'Failed to inspect retrieval health',
+    });
+  }
 });
 
 

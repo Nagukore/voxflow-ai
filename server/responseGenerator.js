@@ -84,10 +84,10 @@ async function llmGenerate({ queryType, intent, message, contextText, history })
   try {
     const chat = geminiModel.startChat({
       history: [],
-      systemInstruction: SYSTEM_PROMPT,
     });
 
-    const result = await chat.sendMessage(prompt);
+    const fullPrompt = `${SYSTEM_PROMPT}\n\n${prompt}`;
+    const result = await chat.sendMessage(fullPrompt);
     const text = result.response.text();
 
     // Ensure response isn't too long for voice

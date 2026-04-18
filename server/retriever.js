@@ -4,26 +4,74 @@
  * Falls back to in-memory TF-IDF-like search if Python backend is not configured.
  */
 
-function getPythonApiUrl() {
-  return process.env.PYTHON_QDRANT_URL || 'http://127.0.0.1:8000';
+import { QdrantClient } from '@qdrant/js-client-rest';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+function getRetrieverConfig() {
+  return {
+    qdrantUrl: process.env.QDRANT_URL,
+    qdrantApiKey: process.env.QDRANT_API_KEY,
+    geminiApiKey: process.env.GEMINI_API_KEY,
+    qdrantCollection: process.env.QDRANT_COLLECTION || 'voxflow-kb',
+    pythonApiUrl: process.env.PYTHON_QDRANT_URL || 'http://127.0.0.1:8001',
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
-// ── Python FastApi Qdrant + Ollama ────────────────────────────
+// ── Qdrant + Gemini Retrieval ─────────────────────────────────
 // ══════════════════════════════════════════════════════════════
 
 let qdrantReady = false;
+let qdrantClient = null;
+let embeddingModel = null;
+let lastRetrieverPath = 'in_memory';
+let lastDirectError = null;
+let lastPythonError = null;
 
 /**
  * Initialize / Check Python Backend.
  * Called once at server startup.
  */
 export async function initQdrant() {
-  const pythonApiUrl = getPythonApiUrl();
-  console.log('[VoxFlow] ℹ️ Checking Python Qdrant backend...');
-  qdrantReady = true;
-  console.log(`[VoxFlow] ✅ Python Qdrant Backend enabled at ${pythonApiUrl}`);
-  return true;
+  console.log('[VoxFlow] ℹ️ Checking direct Qdrant retrieval setup...');
+  const {
+    qdrantUrl,
+    qdrantApiKey,
+    geminiApiKey,
+    qdrantCollection,
+  } = getRetrieverConfig();
+
+  if (!qdrantUrl || !qdrantApiKey || !geminiApiKey) {
+    qdrantReady = false;
+    lastRetrieverPath = 'in_memory';
+    lastDirectError = 'Missing Qdrant/Gemini env vars';
+    console.warn('[VoxFlow] ⚠️ Missing Qdrant/Gemini env vars, using fallback retriever');
+    return false;
+  }
+
+  try {
+    qdrantClient = new QdrantClient({
+      url: qdrantUrl,
+      apiKey: qdrantApiKey,
+      checkCompatibility: false,
+    });
+    const genAI = new GoogleGenerativeAI(geminiApiKey);
+    embeddingModel = genAI.getGenerativeModel({ model: 'gemini-embedding-001' });
+
+    // Validate target collection exists and is reachable.
+    await qdrantClient.getCollection(qdrantCollection);
+    qdrantReady = true;
+    lastRetrieverPath = 'direct_qdrant';
+    lastDirectError = null;
+    console.log(`[VoxFlow] ✅ Direct Qdrant retrieval enabled (${qdrantCollection})`);
+    return true;
+  } catch (err) {
+    qdrantReady = false;
+    lastDirectError = err?.message || String(err);
+    lastRetrieverPath = 'in_memory';
+    console.warn('[VoxFlow] ⚠️ Direct Qdrant init failed, using fallback retriever:', err.message);
+    return false;
+  }
 }
 
 /**
@@ -44,37 +92,80 @@ export async function embedText(text) {
 }
 
 /**
- * Search Qdrant via Python backend for relevant knowledge.
+ * Search Qdrant directly using Gemini embeddings.
  * @param {string} message - User query
  * @param {number} topK - Number of results
  * @returns {Promise<{answer: string, context: Array, insights: Array, results: Array, contextText: string, sources: string[]}>}
  */
 async function qdrantRetrieve(message, topK = 3) {
   try {
-    const pythonApiUrl = getPythonApiUrl();
-    const response = await fetch(`${pythonApiUrl}/ask?q=${encodeURIComponent(message)}`);
-    if (!response.ok) {
-      throw new Error(`Python API returned ${response.status}`);
-    }
-    const data = await response.json();
-    
-    // Fallbacks if data structure doesn't match perfectly
-    const context = Array.isArray(data.context) ? data.context : [];
-    const insights = data.insights && typeof data.insights === 'object' ? data.insights : {};
-    const answer = typeof data.answer === 'string' ? data.answer : '';
-    const results = context;
-    const contextText = results.map(r => r.text || '').join('\n\n');
-    const sources = [...new Set(results.map(r => r.source || 'Qdrant Backend'))];
-
-    console.log(`[VoxFlow] 🔍 Python Backend Query: ${data.refined_query || message}`);
-    if (answer) {
-      console.log('[VoxFlow] ✅ Python Backend Answer received!');
+    const { qdrantCollection } = getRetrieverConfig();
+    if (!qdrantClient || !embeddingModel) {
+      throw new Error('Direct Qdrant clients not initialized');
     }
 
+    const embedRes = await embeddingModel.embedContent(message);
+    const vector = embedRes?.embedding?.values;
+    if (!Array.isArray(vector) || vector.length === 0) {
+      throw new Error('Failed to generate query embedding');
+    }
+
+    const searchResults = await qdrantClient.search(qdrantCollection, {
+      vector,
+      limit: Math.max(1, topK),
+      with_payload: true,
+    });
+
+    const results = (searchResults || []).map((result) => {
+      const payload = result?.payload || {};
+      const normalizedText = payload.text || payload.content || '';
+      return {
+        ...payload,
+        text: normalizedText,
+        score: result?.score,
+      };
+    }).filter(item => item.text);
+
+    const context = results;
+    const insights = {};
+    const answer = '';
+    const contextText = results.map(r => r.text).join('\n\n');
+    const sources = [...new Set(results.map(r => r.source || 'Qdrant'))];
+
+    lastRetrieverPath = 'direct_qdrant';
+    lastDirectError = null;
+    console.log(`[VoxFlow] 🔍 Qdrant query: "${message}" (${results.length} hits)`);
     return { answer, context, insights, results, contextText, sources };
   } catch (err) {
-    console.error('[VoxFlow] Python API search error:', err.message);
-    // Fallback to in-memory
+    lastDirectError = err?.message || String(err);
+    console.error('[VoxFlow] Direct Qdrant search error:', err.message);
+
+    // Optional secondary fallback via Python API if configured.
+    const { pythonApiUrl } = getRetrieverConfig();
+    if (pythonApiUrl) {
+      try {
+        const response = await fetch(`${pythonApiUrl}/ask?q=${encodeURIComponent(message)}`);
+        if (response.ok) {
+          const data = await response.json();
+          const context = Array.isArray(data.context) ? data.context : [];
+          const insights = data.insights && typeof data.insights === 'object' ? data.insights : {};
+          const answer = typeof data.answer === 'string' ? data.answer : '';
+          const results = context;
+          const contextText = results.map(r => r.text || r.content || '').join('\n\n');
+          const sources = [...new Set(results.map(r => r.source || 'Python Qdrant Backend'))];
+          lastRetrieverPath = 'python_backend';
+          lastPythonError = null;
+          console.log(`[VoxFlow] 🔁 Fallback Python backend query: ${data.refined_query || message}`);
+          return { answer, context, insights, results, contextText, sources };
+        }
+        lastPythonError = `HTTP ${response.status}`;
+      } catch (pythonErr) {
+        lastPythonError = pythonErr?.message || String(pythonErr);
+        console.error('[VoxFlow] Python fallback search error:', pythonErr.message);
+      }
+    }
+
+    lastRetrieverPath = 'in_memory';
     return inMemoryRetrieve(message, topK);
   }
 }
@@ -212,10 +303,39 @@ function inMemoryRetrieve(message, topK = 3) {
  * @returns {Promise<{answer: string, context: Array, insights: Array, results: Array, contextText: string, sources: string[]}>}
  */
 export async function retrieve(message, topK = 3) {
-  if (qdrantReady) {
-    return qdrantRetrieve(message, topK);
+  // Always route through qdrantRetrieve so it can try:
+  // 1) direct Qdrant, 2) Python backend, 3) in-memory fallback.
+  return qdrantRetrieve(message, topK);
+}
+
+export async function getRetrievalHealth() {
+  const { qdrantCollection, pythonApiUrl } = getRetrieverConfig();
+
+  let pythonBackendReachable = false;
+  let pythonStatusCode = null;
+  if (pythonApiUrl) {
+    try {
+      const response = await fetch(`${pythonApiUrl}/docs`, {
+        signal: AbortSignal.timeout(1500),
+      });
+      pythonBackendReachable = response.ok;
+      pythonStatusCode = response.status;
+    } catch {
+      pythonBackendReachable = false;
+    }
   }
-  return inMemoryRetrieve(message, topK);
+
+  return {
+    activePath: lastRetrieverPath,
+    directQdrantReady: qdrantReady,
+    collection: qdrantCollection,
+    pythonBackendConfigured: Boolean(pythonApiUrl),
+    pythonBackendReachable,
+    pythonStatusCode,
+    lastDirectError,
+    lastPythonError,
+    checkedAt: new Date().toISOString(),
+  };
 }
 
 /**

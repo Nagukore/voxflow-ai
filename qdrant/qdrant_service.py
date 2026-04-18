@@ -28,10 +28,10 @@ if QdrantClient and QDRANT_URL and QDRANT_API_KEY:
         cloud_inference=True,
     )
 
-# 🔹 INSERT DATA (INGESTION)
+# INSERT DATA (INGESTION)
 def insert_data(data):
     if not client:
-        print("⚠️ Qdrant cloud client unavailable. Skipping remote ingestion.")
+        print("WARN: Qdrant cloud client unavailable. Skipping remote ingestion.")
         return
 
     points = []
@@ -56,19 +56,23 @@ def insert_data(data):
     )
 
 
-# 🔹 RETRIEVE DATA
+# RETRIEVE DATA
 def retrieve_context(query: str):
     if client and Document:
-        results = client.query_points(
-            collection_name="voxflow",
-            query=Document(
-                text=query,
-                model="sentence-transformers/all-minilm-l6-v2"
-            ),
-            using="text_vector",
-            limit=3
-        )
-        return [p.payload for p in results.points]
+        try:
+            results = client.query_points(
+                collection_name="voxflow",
+                query=Document(
+                    text=query,
+                    model="sentence-transformers/all-minilm-l6-v2"
+                ),
+                using="text_vector",
+                limit=3
+            )
+            return [p.payload for p in results.points]
+        except Exception as e:
+            print(f"WARN: Qdrant Cloud fetch failed: {e}")
+            print("INFO: Falling back to local mock data gracefully.")
 
     # Local fallback: retrieve from mock data in this folder.
     normalized_query = query.lower()
